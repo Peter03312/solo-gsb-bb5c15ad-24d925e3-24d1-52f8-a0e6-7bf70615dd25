@@ -90,6 +90,7 @@
           其他人凭<strong>房间码</strong>加入，观看<strong>同一舞台与逐灯亮度</strong>。
           房间固定创建时所选版本，保存播放/暂停、基准时码、速度与修订号，由服务端按时间推算当前时码，
           到版本末尾自动停住；页面刷新、服务重启或观看者重连后都能恢复房间进度；
+          创建时可勾选<strong>启用回路超载保护</strong>：播放会在首个超载区间左边界自动暂停、不越过危险段；
           之后修改草稿、重新发布都不影响本房间，也不会改动版本、草稿或调光记录。
         </p>
 
@@ -97,6 +98,10 @@
         <form id="form-room-create" class="inline-form">
           <select id="room-create-version" required style="min-width:16rem"></select>
           <input type="text" id="room-create-label" placeholder="房间备注（可留空）" />
+          <label class="room-protect-toggle" title="启用后播放会在超载区间左边界自动暂停，不越过危险段">
+            <input type="checkbox" id="room-create-protection" />
+            启用回路超载保护
+          </label>
           <button class="primary" type="submit">🎟 创建共享房间</button>
         </form>
         <div id="room-create-error" class="error-line" hidden></div>
@@ -130,6 +135,7 @@
             <input type="text" id="room-key-input" placeholder="输入控制密钥以接管播放（持密钥者）" style="flex:1" />
             <button id="btn-room-apply-key">应用密钥</button>
           </div>
+          <div id="room-protection" class="room-protection" hidden></div>
           <div class="row transport" id="room-transport">
             <button id="btn-room-play" class="primary">▶ 播放</button>
             <button id="btn-room-pause">⏸ 暂停</button>

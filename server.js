@@ -1381,10 +1381,19 @@ app.post('/api/merge/commit', (req, res) => {
 // 均能恢复进度。后续草稿修改和发布不影响它。房间操作不改版本、草稿或调光记录。
 // 持密钥者可播放、暂停、跳转及设置 0.5/1/2 倍速；控制请求携带当前修订号，过期返回
 // 409 冲突且不改房间。
+//
+// 回路超载保护（创建时可选启用）：只使用房间固定版本快照中的回路容量与灯具接线
+// （旧版快照无回路配置时没有任何超载回路）。服务端按既有逐灯亮度与负载规则，找出
+// 播放方向上首个负载【严格大于】容量的区间左边界；播放惰性推算一旦抵达该边界即
+// 暂停在此并惰性落库（不增加控制修订号），返回触发回路与演出时码——观看端轮询
+// 间隔再长也不会越过危险段。当前时码已超载时拒绝播放；播放中跳入超载段拒绝且
+// 房间不变；暂停时允许跳转（可用于跳过/避开危险段）。
 
 const ROOM_CODE_LEN = 6;
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 去除 0/O/1/I 等易混字符
 const ROOM_SPEEDS = [0.5, 1, 2];
+// 与引擎一致的端点浮点容差（超载区间端点已按 1e-9 归整）
+const ROOM_EPS = 1e-7;
 
 function genRoomCode() {
   for (;;) {
@@ -1416,24 +1425,142 @@ function roomDurationForSnapshot(snap) {
   return Engine.showDuration(Engine.prepareCues(snap.cues));
 }
 
+/* ---------------- 房间超载保护（基于不可变版本快照，进程内缓存） ---------------- */
+
+// versionId -> 保护器。版本快照不可变，故缓存永不失效；快照无回路配置时
+// circuits 为空数组（启用了保护也不会产生任何超载回路）。
+const roomGuardCache = new Map();
+
+function loadRoomGuard(versionId) {
+  const cached = roomGuardCache.get(versionId);
+  if (cached) return cached;
+  const snap = loadVersionSnapshot(versionId);
+  if (!snap) return null;
+  const baseCues = Engine.prepareCues(snap.cues);
+  const duration = Engine.showDuration(baseCues);
+  const membersByCircuit = buildCircuitMembers(snap);
+
+  const circuitsInOrder = [];
+  // 全部回路的超载区间左边界（按时码、再按回路编号定序），供播放方向上取“首个”
+  const boundaries = [];
+  for (const c of snap.circuits) {
+    const members = membersByCircuit.get(c.id) || [];
+    // 保护判定与负载预判页同一套精确求根（一/二次方程，不做步长采样）
+    const intervals =
+      duration > 0
+        ? Engine.circuitOverloadIntervals(new Map(), baseCues, members, 0, duration, c.capacity)
+        : [];
+    const entry = { id: c.id, name: c.name, capacity: c.capacity, members, intervals };
+    circuitsInOrder.push(entry);
+    for (const iv of intervals) boundaries.push({ start: iv.start, interval: iv, circuit: entry });
+  }
+  boundaries.sort((x, y) => x.start - y.start || x.circuit.id - y.circuit.id);
+
+  const guard = {
+    duration,
+    circuitsInOrder,
+    circuitsById: new Map(circuitsInOrder.map((c) => [c.id, c])),
+    boundaries,
+  };
+  roomGuardCache.set(versionId, guard);
+  return guard;
+}
+
+// t 是否落在某条（严格超载）区间内：交点开端点不算超载，触发瞬间闭端点算
+function intervalContains(iv, t) {
+  if (t < iv.start - ROOM_EPS || t > iv.end + ROOM_EPS) return false;
+  if (Math.abs(t - iv.start) <= ROOM_EPS) return !!iv.start_inclusive;
+  if (Math.abs(t - iv.end) <= ROOM_EPS) return !!iv.end_inclusive;
+  return true;
+}
+
+function circuitRef(c) {
+  return { circuit_id: c.id, name: c.name, capacity: c.capacity };
+}
+
+// 时刻 t 全部处于超载状态的回路（按回路编号排序）
+function overloadedCircuitsAt(guard, t) {
+  const out = [];
+  for (const c of guard.circuitsInOrder) {
+    if (c.intervals.some((iv) => intervalContains(iv, t))) out.push(circuitRef(c));
+  }
+  return out;
+}
+
+/**
+ * 播放从锚点时码 fromTime 推进到 t 时撞上的首个超载区间左边界。
+ *  - 边界严格在锚点前方：推进抵达（含恰好抵达开端点——该瞬间负载等于容量，
+ *    按“抵达边界即停”冻结在此，不进入其后的危险段）即拦截；
+ *  - 边界与锚点重合/仅差浮点噪声（开端点恰好等于锚点）：锚点本身尚安全，
+ *    但墙钟一旦真正推进（t > fromTime）就立刻冻结在边界上；
+ *  - 严格位于锚点后方的边界不再拦截。
+ */
+function tripBoundaryBetween(guard, fromTime, t) {
+  for (const b of guard.boundaries) {
+    if (b.start < fromTime - ROOM_EPS) continue; // 严格在身后
+    if (b.start > fromTime + ROOM_EPS) {
+      if (b.start <= t + ROOM_EPS) return b; // 前方边界：已抵达
+    } else if (t > fromTime + ROOM_EPS) {
+      return b; // 锚点就在（开）边界上：时间一推进即冻结在此
+    }
+  }
+  return null;
+}
+
+// 当前位置前方最近的超载边界（仅用于页面提示）
+function nextBoundaryAfter(guard, t) {
+  for (const b of guard.boundaries) {
+    if (b.start >= t - ROOM_EPS) return b;
+  }
+  return null;
+}
+
 /**
  * 读取房间当前状态：服务端按墙钟推算时码。
  * 播放中按 time + (now - anchor_wall) * speed 推算；到末尾则自动停住并惰性落库
  * （不改修订号：这只是时间流逝的结果，不与任何控制竞争）。
+ * 启用超载保护且提供 guard 时：推算一旦抵达前方首个超载区间左边界，即暂停在该
+ * 边界上并惰性落库（同样不改修订号），返回 trip 信息——无论观看端多久轮询一次，
+ * 时码都不会越过危险段。
  */
-function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false } = {}) {
+function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false, guard = null } = {}) {
   let playing = !!row.playing;
   let time = row.time;
+  let ended = false;
+  let trip = null;
+
   if (playing) {
     const elapsed = Math.max(0, now - row.anchor_wall) * row.speed;
     let t = row.time + elapsed;
-    if (t >= row.duration) {
+
+    // 超载保护先于末尾判定：边界一定不晚于版本末尾
+    if (guard) {
+      const hit = tripBoundaryBetween(guard, row.time, t);
+      if (hit) {
+        t = hit.start;
+        playing = false;
+        trip = { circuit_id: hit.circuit.id, time: hit.start };
+      }
+    }
+
+    if (playing && t >= row.duration) {
       t = row.duration;
       playing = false;
-      if (persistStopped) {
+      ended = true;
+    }
+
+    if (!playing && persistStopped) {
+      if (ended) {
         db.prepare(
-          'UPDATE rooms SET playing = 0, time = duration, anchor_wall = ? WHERE id = ?'
+          `UPDATE rooms SET playing = 0, time = duration, anchor_wall = ?,
+                           tripped_circuit_id = NULL, tripped_time = NULL WHERE id = ?`
         ).run(now, row.id);
+      } else if (trip) {
+        // 自动暂停：固化在超载区间左边界；不增加控制修订号
+        db.prepare(
+          `UPDATE rooms SET playing = 0, time = ?, anchor_wall = ?,
+                           tripped_circuit_id = ?, tripped_time = ? WHERE id = ?`
+        ).run(trip.time, now, trip.circuit_id, trip.time, row.id);
       }
     }
     time = t;
@@ -1444,11 +1571,51 @@ function computeRoomState(row, { now = Date.now() / 1000, persistStopped = false
     speed: row.speed,
     duration: row.duration,
     revision: row.revision,
+    ended,
+    trip,
   };
 }
 
+// 组装对外的超载保护状态块（页面据此显示保护状态与触发原因）
+function buildProtection(row, state, guard) {
+  if (!row.overload_protection) return { enabled: false };
+  const block = { enabled: true, configured: !!(guard && guard.circuitsInOrder.length > 0) };
+  if (!guard || guard.circuitsInOrder.length === 0) return block;
+
+  const over = overloadedCircuitsAt(guard, state.time);
+  block.overloaded_now = over.length > 0;
+  block.circuits_overloaded_now = over;
+
+  // 未处于超载段时，预告前方最近的触发边界
+  if (over.length === 0) {
+    const nb = nextBoundaryAfter(guard, state.time);
+    if (nb) {
+      block.next_trip = {
+        time: round6(nb.start),
+        seconds_ahead: round6(Math.max(0, nb.start - state.time)),
+        circuit: circuitRef(nb.circuit),
+      };
+    }
+  }
+
+  // 自动暂停标记由惰性落库的两列恢复（服务重启后同样有效）
+  if (row.tripped_circuit_id !== null && row.tripped_circuit_id !== undefined) {
+    const c = guard.circuitsById.get(row.tripped_circuit_id);
+    block.tripped = {
+      reason: 'overload_boundary',
+      reason_text:
+        '回路超载保护已触发：播放抵达超载区间左边界，已自动暂停在此（自动暂停不增加控制修订号），暂停状态下可跳转避险',
+      time: round6(row.tripped_time ?? state.time),
+      circuit: c
+        ? circuitRef(c)
+        : { circuit_id: row.tripped_circuit_id, name: `回路 #${row.tripped_circuit_id}`, capacity: null },
+    };
+  }
+  return block;
+}
+
 // 房间对外视图（创建/查询/控制共用）；state 由 computeRoomState 得到
-function buildRoomView(row, state, now) {
+function buildRoomView(row, state, now, guard) {
   return {
     code: row.code,
     label: row.label,
@@ -1458,6 +1625,7 @@ function buildRoomView(row, state, now) {
     time: round6(state.time),
     speed: state.speed,
     revision: state.revision,
+    protection: buildProtection(row, state, guard),
     // 服务端墙钟与对应时码：观看端据此校时（基准时码 + 流逝时间 × 速度）
     server_wall: now,
     server_time: round6(state.time),
@@ -1473,6 +1641,15 @@ app.post('/api/rooms', (req, res) => {
   const snap = loadVersionSnapshot(versionId);
   if (!snap) return err(res, 404, `版本不存在：#${versionId}，无法基于它创建共享房间`);
 
+  // 回路超载保护：可选布尔开关；不传等同不启用，沿用原房间行为
+  let overloadProtection = false;
+  if (req.body?.overload_protection !== undefined) {
+    if (typeof req.body.overload_protection !== 'boolean') {
+      return err(res, 400, `超载保护开关无效：${JSON.stringify(req.body.overload_protection)}（须为布尔值 true/false）`);
+    }
+    overloadProtection = req.body.overload_protection;
+  }
+
   const labelRaw = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
   const label = labelRaw || `共享房间（${snap.label}）`;
   const duration = roomDurationForSnapshot(snap);
@@ -1482,15 +1659,20 @@ app.post('/api/rooms', (req, res) => {
 
   const info = db
     .prepare(
-      `INSERT INTO rooms (code, version_id, control_key, label, playing, time, anchor_wall, speed, duration, revision, created_at)
-       VALUES (?, ?, ?, ?, 0, 0, ?, 1, ?, 0, ?)`
+      `INSERT INTO rooms (code, version_id, control_key, label, playing, time, anchor_wall, speed,
+                          duration, revision, overload_protection, tripped_circuit_id, tripped_time, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, 1, ?, 0, ?, NULL, NULL, ?)`
     )
-    .run(code, versionId, controlKey, label, now, duration, now);
+    .run(code, versionId, controlKey, label, now, duration, overloadProtection ? 1 : 0, now);
+
+  // 启用保护即预热保护器（仅读冻结快照，不写任何业务数据）
+  if (overloadProtection) loadRoomGuard(versionId);
 
   const row = db.prepare(`${roomSelect} WHERE r.id = ?`).get(info.lastInsertRowid);
-  const state = computeRoomState(row, { now });
+  const guard = overloadProtection ? loadRoomGuard(versionId) : null;
+  const state = computeRoomState(row, { now, guard });
   res.status(201).json({
-    ...buildRoomView(row, state, now),
+    ...buildRoomView(row, state, now, guard),
     // 控制密钥仅在创建响应中完整返回一次；之后任何接口都不再回显
     control_key: controlKey,
   });
@@ -1505,10 +1687,11 @@ app.get('/api/rooms/:code', (req, res) => {
   let row = getRoomRowByCode(code);
   if (!row) return err(res, 404, `房间不存在：房间码 ${code}（请核对后重新加入）`);
   const now = Date.now() / 1000;
-  // 到末尾自动停住：此处惰性落库，刷新/重启/重连后状态一致
-  const state = computeRoomState(row, { now, persistStopped: true });
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
+  // 到末尾自动停住 / 撞上超载边界自动暂停：此处惰性落库，刷新/重启/重连后状态一致
+  const state = computeRoomState(row, { now, guard, persistStopped: true });
   if (!state.playing) row = getRoomRowByCode(code);
-  res.json(buildRoomView(row, state, now));
+  res.json(buildRoomView(row, state, now, guard));
 });
 
 // 房间控制：持密钥者播放/暂停/跳转/设置速度；携带修订号，过期 409 且不改房间
@@ -1571,6 +1754,7 @@ app.post('/api/rooms/:code/control', (req, res) => {
     }
   }
 
+  const guard = row.overload_protection ? loadRoomGuard(row.version_id) : null;
   const now = Date.now() / 1000;
   const tx = db.transaction(() => {
     const cur = db.prepare(`${roomSelect} WHERE r.id = ?`).get(row.id);
@@ -1586,11 +1770,15 @@ app.post('/api/rooms/:code/control', (req, res) => {
       e.current = cur.revision;
       throw e;
     }
-    const live = computeRoomState(cur, { now, persistStopped: false });
+    // 先按墙钟实时推算（可能已到末尾或已撞上超载边界；此处不落库，随本次控制一并固化）
+    const live = computeRoomState(cur, { now, guard });
 
     let { playing, time } = live;
     let nextSpeed = cur.speed;
-    let anchor = now;
+    const anchor = now;
+    // 写库的自动暂停标记：仅当本次结果确为保护触发的暂停时保留
+    let tripCircuit = live.trip ? live.trip.circuit_id : null;
+    let tripTime = live.trip ? live.trip.time : null;
 
     if (action === 'play') {
       if (live.time >= cur.duration) {
@@ -1601,23 +1789,61 @@ app.post('/api/rooms/:code/control', (req, res) => {
         }
         time = 0; // 已停在末尾：再播放从头开始
       }
+      // 当前时码已处于超载区间（含闭端点）：拒绝播放，房间不变
+      if (guard) {
+        const over = overloadedCircuitsAt(guard, time);
+        if (over.length > 0) {
+          const e = new Error('ROOM_UNSAFE');
+          e.code = 'ROOM_UNSAFE';
+          e.time = time;
+          e.circuits = over;
+          throw e;
+        }
+      }
       playing = true;
+      tripCircuit = null;
+      tripTime = null;
     } else if (action === 'pause') {
       playing = false;
-      anchor = now; // 暂停：把推算出的当前时码固化为新的基准
+      // 非保护触发的普通暂停清除超载标记
+      if (!live.trip) {
+        tripCircuit = null;
+        tripTime = null;
+      }
     } else if (action === 'seek') {
+      // 播放中跳入超载段：拒绝且房间不变；暂停（含已被保护自动暂停）时允许任意跳转避险
+      if (guard && live.playing) {
+        const over = overloadedCircuitsAt(guard, seekTime);
+        if (over.length > 0) {
+          const e = new Error('ROOM_UNSAFE');
+          e.code = 'ROOM_UNSAFE';
+          e.time = seekTime;
+          e.circuits = over;
+          throw e;
+        }
+      }
       time = seekTime;
       if (seekTime >= cur.duration) playing = false; // 跳到末尾即停住
+      // 跳转后人不在触发边界上：清除既有自动暂停标记
+      tripCircuit = null;
+      tripTime = null;
       // 播放/暂停状态沿用（播放则从新时码起按速度继续；暂停锚住该时码）
     } else {
-      // speed：以当前推算时码为新基准，立刻按新速度走
+      // speed：以当前实时推算时码为新基准（若保护刚把播放截停，则停在边界上），
+      // 立刻按新速度继续（暂停则保持暂停）
       nextSpeed = speed;
+      if (!live.trip) {
+        tripCircuit = null;
+        tripTime = null;
+      }
     }
 
     db.prepare(
-      `UPDATE rooms SET playing = ?, time = ?, anchor_wall = ?, speed = ?, revision = revision + 1
+      `UPDATE rooms
+       SET playing = ?, time = ?, anchor_wall = ?, speed = ?, revision = revision + 1,
+           tripped_circuit_id = ?, tripped_time = ?
        WHERE id = ?`
-    ).run(playing ? 1 : 0, time, anchor, nextSpeed, cur.id);
+    ).run(playing ? 1 : 0, time, anchor, nextSpeed, tripCircuit, tripTime, cur.id);
     return db.prepare(`${roomSelect} WHERE r.id = ?`).get(cur.id);
   });
 
@@ -1638,11 +1864,21 @@ app.post('/api/rooms/:code/control', (req, res) => {
     if (e.code === 'ROOM_ZERO_DURATION') {
       return err(res, 400, '该房间固定的版本时长为 0（没有 Cue），无法播放');
     }
+    if (e.code === 'ROOM_UNSAFE') {
+      // 400 明确拒绝：当前/目标时码已超载。不改动房间、不增加修订号
+      const names = e.circuits.map((c) => `回路 #${c.circuit_id}「${c.name}」`).join('、');
+      return res.status(400).json({
+        error: `时码 ${round6(e.time)} 秒处 ${names} 负载严格大于容量：${action === 'play' ? '当前已超载，拒绝播放' : '播放中不得跳入超载段'}；请先在暂停状态下跳转到安全时码（本次未改动房间）`,
+        reason: 'overloaded_timecode',
+        time: round6(e.time),
+        circuits: e.circuits,
+      });
+    }
     throw e;
   }
 
-  const state = computeRoomState(updated, { now });
-  res.json(buildRoomView(updated, state, now));
+  const state = computeRoomState(updated, { now, guard });
+  res.json(buildRoomView(updated, state, now, guard));
 });
 
 /* ------------------------------- 错误处理 ------------------------------ */

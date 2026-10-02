@@ -614,8 +614,13 @@ $('form-room-create').addEventListener('submit', async (e) => {
   const version_id = $('room-create-version').value;
   if (!version_id) return showErr($('room-create-error'), '还没有已发布版本，请先到「发布版本」页冻结一版。');
   try {
-    const d = await api('POST', '/api/rooms', { version_id, label: $('room-create-label').value });
+    const d = await api('POST', '/api/rooms', {
+      version_id,
+      label: $('room-create-label').value,
+      overload_protection: $('room-create-protection').checked,
+    });
     $('room-create-label').value = '';
+    $('room-create-protection').checked = false;
     saveRoomKey(d.code, d.control_key);
     $('room-created').hidden = false;
     $('room-created').innerHTML =
@@ -682,6 +687,7 @@ async function enterRoom(code, key, initialView) {
   startRoomLoop();
   renderRoomRole();
   renderRoom();
+  renderRoomProtection();
 
   document.querySelector('.tab[data-tab="room"]').click();
 }
@@ -698,10 +704,16 @@ function applyRoomAnchor(view) {
 
 // 当前按服务端锚点推算出的本地时码；到末尾自动停住（与服务端同规则）
 function roomCurrentTime(nowSec) {
-  const a = state.room.anchor;
-  if (!a.playing) return Math.min(a.time, state.room.view.duration);
-  const t = a.time + Math.max(0, nowSec - a.wall) * a.speed;
-  return Math.min(t, state.room.view.duration);
+  const r = state.room;
+  const a = r.anchor;
+  if (!a.playing) return Math.min(a.time, r.view.duration);
+  let t = a.time + Math.max(0, nowSec - a.wall) * a.speed;
+  t = Math.min(t, r.view.duration);
+  // 超载保护：即使观看端轮询间隔较长，两次同步之间也不越过前方首个超载边界
+  // （服务端会在该边界自动暂停，下一次轮询即把锚点校正为暂停在边界）
+  const p = r.view.protection;
+  if (p && p.enabled && p.next_trip && t > p.next_trip.time) t = p.next_trip.time;
+  return t;
 }
 
 function startRoomLoop() {
@@ -732,6 +744,7 @@ async function pollRoom() {
     applyRoomAnchor(view);
     $('room-speed').value = String(view.speed);
     renderRoomRole();
+    renderRoomProtection();
   } catch {
     /* 单次轮询失败不打断观看：下一周期重试 */
   }
@@ -776,6 +789,8 @@ async function roomControl(action, extra = {}) {
     applyRoomAnchor(view);
     $('room-speed').value = String(view.speed);
     renderRoomRole();
+    renderRoomProtection();
+    renderRoomProtection();
   } catch (err2) {
     if (err2.status === 409) {
       await pollRoom(); // 过期：按服务端最新状态校时后提示重试
@@ -829,6 +844,49 @@ function renderRoom() {
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
   renderStageInto(r.session, t, $('room-stage'), $('room-levels'), $('room-cue-timeline'));
+}
+
+// 回路超载保护状态条：未启用 / 已启用安全 / 当前已超载 / 已在边界自动暂停
+function renderRoomProtection() {
+  const r = state.room;
+  if (!r) return;
+  const box = $('room-protection');
+  const p = r.view.protection;
+  if (!p || !p.enabled) {
+    box.hidden = true;
+    box.textContent = '';
+    box.className = 'room-protection';
+    return;
+  }
+  box.hidden = false;
+  const circuitText = (c) =>
+    c ? `回路 #${c.circuit_id}「${c.name}」（容量 ${c.capacity == null ? '—' : c.capacity}W）` : '';
+
+  let cls;
+  let html;
+  if (!p.configured) {
+    cls = 'is-off';
+    html = '<span class="rp-title">回路超载保护：已启用</span>该房间固定版本没有回路配置（旧版快照），不产生任何超载回路，播放按原规则进行。';
+  } else if (p.tripped) {
+    cls = 'is-tripped';
+    html = `<span class="rp-title">⚠ 超载保护已触发</span>${esc(p.tripped.reason_text)}` +
+      `<br>触发回路：<span class="rp-circuit">${esc(circuitText(p.tripped.circuit))}</span>` +
+      ` · 演出时码 <b>${fmt(p.tripped.time)}</b> s（可在暂停状态下跳转避险后再播放）`;
+  } else if (p.overloaded_now) {
+    const names = (p.circuits_overloaded_now || []).map((c) => esc(circuitText(c))).join('、');
+    cls = 'is-warn';
+    html = `<span class="rp-title">⛔ 当前时码处于超载段</span>${names} 负载严格大于容量：禁止播放；请暂停后跳转到安全时码。`;
+  } else if (p.next_trip) {
+    cls = 'is-safe';
+    html = `<span class="rp-title">回路超载保护：已启用</span>前方首个超载边界在演出时码 ` +
+      `<b>${fmt(p.next_trip.time)}</b> s（约 ${fmt(p.next_trip.seconds_ahead)} 秒后），` +
+      `触发回路 <span class="rp-circuit">${esc(circuitText(p.next_trip.circuit))}</span>：播放抵达即自动暂停，不会越过危险段。`;
+  } else {
+    cls = 'is-safe';
+    html = '<span class="rp-title">回路超载保护：已启用</span>前方时程内没有超载区间，可安全播放。';
+  }
+  box.className = `room-protection ${cls}`;
+  box.innerHTML = html;
 }
 
 /* ----------------------------- 版本比对 ----------------------------- */

@@ -133,6 +133,13 @@ CREATE TABLE IF NOT EXISTS rooms (
   speed       REAL NOT NULL DEFAULT 1,       -- 仅允许 0.5 / 1 / 2
   duration    REAL NOT NULL,                 -- 创建时按版本快照算出的末尾时刻（一并冻结）
   revision    INTEGER NOT NULL DEFAULT 0,   -- 控制修订号：每次成功控制 +1，过期提交 409
+  -- 回路超载保护：创建时可选启用；启用后只按固定版本快照内的回路容量与灯具接线判定
+  -- （1 启用 / 0 未启用，未启用的房间完全沿用原行为）
+  overload_protection INTEGER NOT NULL DEFAULT 0,
+  -- 保护自动暂停时固化的触发回路（快照回路编号）与触发时码；非自动暂停状态为 NULL。
+  -- 惰性落库与末尾停住一样不增加控制修订号；服务重启后据此恢复保护状态。
+  tripped_circuit_id INTEGER,
+  tripped_time       REAL,
   created_at  REAL NOT NULL
 );
 `;
@@ -147,6 +154,20 @@ function migrate(database) {
   }
   if (!cols.includes('watts')) {
     database.exec('ALTER TABLE lights ADD COLUMN watts REAL');
+  }
+
+  // 共享房间超载保护：旧库补列（未启用保护的既有房间默认沿用原行为）
+  const roomCols = database.prepare('PRAGMA table_info(rooms)').all().map((c) => c.name);
+  if (roomCols.length > 0) {
+    if (!roomCols.includes('overload_protection')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN overload_protection INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!roomCols.includes('tripped_circuit_id')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN tripped_circuit_id INTEGER');
+    }
+    if (!roomCols.includes('tripped_time')) {
+      database.exec('ALTER TABLE rooms ADD COLUMN tripped_time REAL');
+    }
   }
 }
 
