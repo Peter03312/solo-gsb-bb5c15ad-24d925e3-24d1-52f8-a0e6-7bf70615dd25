@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS merge_previews (
 -- 房间固定所选版本（version_id 指向不可变快照）；保存播放/暂停、基准时码与基准墙钟、
 -- 速度与修订号。服务端按 (time + (now - anchor_wall)*speed) 推算当前时码，
 -- 到 duration 自动停住（惰性落库）；页面刷新、服务重启、观看者重连后均可据此恢复进度。
+-- overload_protected=1 时启用回路超载保护：只使用房间固定版本中的回路容量与灯具接线，
+-- guard_* 为本次播放方向上首个超载区间左边界（抵达即自动暂停，不加修订号），
+-- tripped_* 记录最近一次自动暂停的触发回路/时码/负载；暂停态跳转不做拦截以便避险。
 CREATE TABLE IF NOT EXISTS rooms (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   code        TEXT NOT NULL UNIQUE,          -- 房间码（6 位大写字母数字，去除易混字符）
@@ -133,6 +136,16 @@ CREATE TABLE IF NOT EXISTS rooms (
   speed       REAL NOT NULL DEFAULT 1,       -- 仅允许 0.5 / 1 / 2
   duration    REAL NOT NULL,                 -- 创建时按版本快照算出的末尾时刻（一并冻结）
   revision    INTEGER NOT NULL DEFAULT 0,   -- 控制修订号：每次成功控制 +1，过期提交 409
+  overload_protected INTEGER NOT NULL DEFAULT 0, -- 1 启用回路超载保护；未启用沿用原行为
+  guard_until REAL,                          -- 本次播放前方首个超载边界时码（抵达即自动暂停）
+  guard_circuit_id   INTEGER,                -- 前方边界所属回路（版本快照中的回路编号）
+  guard_circuit_name TEXT,                   -- 回路名称（触发响应直接可读）
+  guard_load REAL,                           -- 边界处该回路负载（瓦）
+  tripped     INTEGER NOT NULL DEFAULT 0,    -- 1 当前暂停由超载自动暂停造成（人工控制后清零）
+  tripped_at  REAL,                          -- 自动暂停发生的演出时码（= guard_until）
+  tripped_circuit_id   INTEGER,              -- 触发回路编号
+  tripped_circuit_name TEXT,                 -- 触发回路名称
+  tripped_load REAL,                         -- 触发时刻回路负载（瓦）
   created_at  REAL NOT NULL
 );
 `;
@@ -148,6 +161,22 @@ function migrate(database) {
   if (!cols.includes('watts')) {
     database.exec('ALTER TABLE lights ADD COLUMN watts REAL');
   }
+
+  // 旧库 rooms 表无回路超载保护列：补齐并按“未启用”初始化，既有房间行为完全不变
+  const roomCols = database.prepare('PRAGMA table_info(rooms)').all().map((c) => c.name);
+  const addRoomCol = (name, ddl) => {
+    if (!roomCols.includes(name)) database.exec(`ALTER TABLE rooms ADD COLUMN ${ddl}`);
+  };
+  addRoomCol('overload_protected', 'overload_protected INTEGER NOT NULL DEFAULT 0');
+  addRoomCol('guard_until', 'guard_until REAL');
+  addRoomCol('guard_circuit_id', 'guard_circuit_id INTEGER');
+  addRoomCol('guard_circuit_name', 'guard_circuit_name TEXT');
+  addRoomCol('guard_load', 'guard_load REAL');
+  addRoomCol('tripped', 'tripped INTEGER NOT NULL DEFAULT 0');
+  addRoomCol('tripped_at', 'tripped_at REAL');
+  addRoomCol('tripped_circuit_id', 'tripped_circuit_id INTEGER');
+  addRoomCol('tripped_circuit_name', 'tripped_circuit_name TEXT');
+  addRoomCol('tripped_load', 'tripped_load REAL');
 }
 
 function open(dbPath) {

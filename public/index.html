@@ -97,6 +97,10 @@
         <form id="form-room-create" class="inline-form">
           <select id="room-create-version" required style="min-width:16rem"></select>
           <input type="text" id="room-create-label" placeholder="房间备注（可留空）" />
+          <label class="room-protect-toggle" title="启用后只使用该房间固定版本中的回路容量与灯具接线：播放抵达首个超载区间左边界即自动暂停，当前时码超载时拒绝播放，播放中跳入超载段也会被拒绝">
+            <input type="checkbox" id="room-create-protect" />
+            启用回路超载保护
+          </label>
           <button class="primary" type="submit">🎟 创建共享房间</button>
         </form>
         <div id="room-create-error" class="error-line" hidden></div>
@@ -150,6 +154,7 @@
           <div class="row">
             <input id="room-timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" disabled />
           </div>
+          <div id="room-protection" class="protection-line" hidden></div>
           <div id="room-error" class="error-line" hidden></div>
         </div>
 

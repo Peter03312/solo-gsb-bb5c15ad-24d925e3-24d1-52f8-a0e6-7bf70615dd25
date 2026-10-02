@@ -245,3 +245,31 @@ tr.cmp-hot td { color: var(--amber-soft); }
 #room-timeline:disabled {
   opacity: 0.7;
 }
+
+/* 回路超载保护状态条 */
+.room-protect-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.protection-line {
+  margin-top: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.86rem;
+  border: 1px solid var(--line);
+  background: #14121d;
+}
+.protection-line b { color: inherit; }
+.protection-line.safe { border-color: #2f5d40; background: rgba(76, 208, 125, 0.07); color: var(--ok); }
+.protection-line.info { border-color: var(--line); color: var(--muted); }
+.protection-line.warn { border-color: #7a5a16; background: rgba(245, 185, 66, 0.08); color: var(--amber-soft); }
+.protection-line.danger {
+  border-color: #5a2d36;
+  background: rgba(255, 107, 107, 0.1);
+  color: var(--danger);
+}

@@ -614,8 +614,13 @@ $('form-room-create').addEventListener('submit', async (e) => {
   const version_id = $('room-create-version').value;
   if (!version_id) return showErr($('room-create-error'), '还没有已发布版本，请先到「发布版本」页冻结一版。');
   try {
-    const d = await api('POST', '/api/rooms', { version_id, label: $('room-create-label').value });
+    const d = await api('POST', '/api/rooms', {
+      version_id,
+      label: $('room-create-label').value,
+      overload_protected: $('room-create-protect').checked,
+    });
     $('room-create-label').value = '';
+    $('room-create-protect').checked = false;
     saveRoomKey(d.code, d.control_key);
     $('room-created').hidden = false;
     $('room-created').innerHTML =
@@ -813,6 +818,11 @@ $('btn-room-leave').addEventListener('click', () => {
 function leaveRoom() {
   stopRoomLoop();
   state.room = null;
+  lastRoomProtectionSig = '';
+  const prot = $('room-protection');
+  prot.hidden = true;
+  prot.textContent = '';
+  prot.className = 'protection-line';
   $('room-workspace').hidden = true;
   $('room-lobby').hidden = false;
   $('room-join-code').value = '';
@@ -828,7 +838,50 @@ function renderRoom() {
   $('room-time-current').textContent = fmt(t);
   $('room-timeline').value = String(t);
   $('room-revision-view').textContent = String(r.view.revision);
+  renderRoomProtection(r.view.protection, t);
   renderStageInto(r.session, t, $('room-stage'), $('room-levels'), $('room-cue-timeline'));
+}
+
+// 回路超载保护状态条：展示启用状态、前方边界与自动暂停的触发回路/时码/负载。
+// 用内容签名缓存避免每帧重写 DOM。
+let lastRoomProtectionSig = '';
+function renderRoomProtection(p, t) {
+  const el = $('room-protection');
+  if (!p) {
+    lastRoomProtectionSig = '';
+    el.hidden = true;
+    el.textContent = '';
+    el.className = 'protection-line';
+    return;
+  }
+  let cls = 'protection-line';
+  let html = '';
+  if (p.status === 'no_config') {
+    cls += ' info';
+    html = '🛡 回路超载保护已启用：房间固定版本中没有回路配置（旧版快照），<b>没有超载回路</b>，播放不被拦截。';
+  } else if (p.status === 'tripped' && p.tripped) {
+    cls += ' danger';
+    html =
+      `⛔ 因<b>回路超载</b>已自动暂停在 <b>${fmt(p.tripped.time)}</b> s：` +
+      `触发回路「${esc(p.tripped.circuit.name)}」当时负载 <b>${fmt(p.tripped.load)}</b> W，严格大于容量。` +
+      `暂停状态下可跳转到安全时码避险，再按播放。`;
+  } else if (p.status === 'watching' && p.next_boundary) {
+    cls += ' warn';
+    const remain = Math.max(0, p.next_boundary.time - t);
+    html =
+      `🛡 回路超载保护启用中：播放方向首个超载边界 <b>${fmt(p.next_boundary.time)}</b> s` +
+      `（回路「${esc(p.next_boundary.circuit.name)}」，剩余约 <b>${fmt(remain)}</b> s），抵达即自动暂停，不会越过危险段。`;
+  } else {
+    cls += ' safe';
+    html = '🛡 回路超载保护已启用：当前已暂停，可跳转到任意时码（含超载段）避险；从超载时码播放会被拒绝。';
+  }
+  const sig = `${cls}|${html}`;
+  if (sig !== lastRoomProtectionSig) {
+    lastRoomProtectionSig = sig;
+    el.className = cls;
+    el.innerHTML = html;
+    el.hidden = false;
+  }
 }
 
 /* ----------------------------- 版本比对 ----------------------------- */
